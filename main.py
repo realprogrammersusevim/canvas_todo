@@ -32,7 +32,10 @@ def parse_canvas_datetime(date_str):
         return None
 
     try:
-        return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ")
+        # Canvas returns UTC timestamps with a trailing "Z".
+        # Convert to local time so the date isn't off by one.
+        iso_str = date_str.replace("Z", "+00:00")
+        return datetime.fromisoformat(iso_str).astimezone()
     except ValueError:
         return None
 
