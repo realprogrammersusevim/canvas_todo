@@ -55,6 +55,11 @@ def add_to_things(title, notes, date_str, tag="Canvas"):
         "show-quick-entry": "false",  # Set to 'true' if you want to verify before adding
     }
 
+    # Add Canvas todos to a specific list
+    list_name = os.getenv("LIST_NAME")
+    if list_name and list_name != "":
+        params["list"] = list_name
+
     # Handle Date Parsing (Canvas returns ISO 8601: 2023-10-27T23:59:59Z)
     dt_obj = parse_canvas_datetime(date_str)
     if dt_obj:
