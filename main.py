@@ -86,8 +86,8 @@ def main():
     # Get current user
     user = canvas.get_current_user()
 
-    # Get active courses
-    courses = user.get_courses(enrollment_state="active")
+    # if there aren't favorited courses this defaults to enrolled courses
+    courses = user.get_favorite_courses()
 
     print("Fetching assignments...")
 
