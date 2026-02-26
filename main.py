@@ -16,31 +16,31 @@ canvas = Canvas(os.getenv("API_URL"), os.getenv("API_KEY"))
 IMPORT_CACHE = Path(".imported_assignments.json")
 
 
-def load_imported_ids():
+def load_imported_ids() -> set[str]:
     if not IMPORT_CACHE.exists():
         return set()
 
     return set(json.loads(IMPORT_CACHE.read_text()))
 
 
-def save_imported_ids(ids_set):
+def save_imported_ids(ids_set: set[str]) -> None:
     IMPORT_CACHE.write_text(json.dumps(sorted(ids_set), indent=2))
 
 
-def parse_canvas_datetime(date_str):
-    if not date_str:
+def parse_canvas_datetime(date: str) -> datetime | None:
+    if not date:
         return None
 
     try:
         # Canvas returns UTC timestamps with a trailing "Z".
         # Convert to local time so the date isn't off by one.
-        iso_str = date_str.replace("Z", "+00:00")
+        iso_str = date.replace("Z", "+00:00")
         return datetime.fromisoformat(iso_str).astimezone()
     except ValueError:
         return None
 
 
-def add_to_things(title, notes, date_str, tag="Canvas"):
+def add_to_things(title: str, notes: str, date_str: str, tags=[]) -> None:
     """
     Constructs a Things 3 URL to add a task and executes it.
     """
@@ -51,7 +51,7 @@ def add_to_things(title, notes, date_str, tag="Canvas"):
     params = {
         "title": title,
         "notes": notes,
-        "tags": tag,
+        "tags": f"{','.join(tags)},New",
         "show-quick-entry": "false",  # Set to 'true' if you want to verify before adding
     }
 
@@ -73,7 +73,7 @@ def add_to_things(title, notes, date_str, tag="Canvas"):
     webbrowser.open(final_url)
 
 
-def format_description(description_html):
+def format_description(description_html: str):
     if not description_html:
         return ""
 
