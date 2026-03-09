@@ -88,6 +88,7 @@ def migrate_tasks() -> None:
             if "{tag_name}" is in todoTags then
                 if (id of aTodo) is not in inboxIds then
                     move aTodo to targetArea
+                    remove tag "{tag_name}" from aTodo
                     set movedCount to movedCount + 1
                 end if
             end if
