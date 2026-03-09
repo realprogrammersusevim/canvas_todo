@@ -1,6 +1,8 @@
 import json
 import os
 from pathlib import Path
+import argparse
+import subprocess
 import webbrowser
 import urllib.parse
 from datetime import datetime
@@ -40,25 +42,20 @@ def parse_canvas_datetime(date: str) -> datetime | None:
         return None
 
 
-def add_to_things(title: str, notes: str, date_str: str, tags=[]) -> None:
+def add_to_things(title: str, notes: str, date_str: str, tags: list[str] = []) -> None:
     """
-    Constructs a Things 3 URL to add a task and executes it.
+    Constructs a Things 3 URL to add a task to the Inbox and executes it.
+    New tasks are always tagged so they can be identified and migrated later.
     """
-    # Base Things 3 URL
     base_url = "things:///add?"
 
-    # Parameters for the task
+    all_tags = list(tags) + [os.getenv("TAG_NAME", "New")]
     params = {
         "title": title,
         "notes": notes,
-        "tags": f"{','.join(tags)},New",
-        "show-quick-entry": "false",  # Set to 'true' if you want to verify before adding
+        "tags": ",".join(all_tags),
+        "show-quick-entry": "false",
     }
-
-    # Add Canvas todos to a specific list
-    list_name = os.getenv("LIST_NAME")
-    if list_name and list_name != "":
-        params["list"] = list_name
 
     # Handle Date Parsing (Canvas returns ISO 8601: 2023-10-27T23:59:59Z)
     dt_obj = parse_canvas_datetime(date_str)
@@ -71,6 +68,42 @@ def add_to_things(title: str, notes: str, date_str: str, tags=[]) -> None:
 
     # Open the URL (Fires the command to Things 3)
     webbrowser.open(final_url)
+
+
+def migrate_tasks() -> None:
+    """
+    Uses AppleScript to find all tagged todos that are no longer in the
+    Inbox (i.e. have been reviewed and scheduled) and moves them to a list.
+    """
+    area_name = os.getenv("AREA_NAME", "New")
+    tag_name = os.getenv("TAG_NAME", "New")
+    script = f"""
+    tell application "Things3"
+        set targetArea to area "{area_name}"
+        set inboxIds to id of (to dos of list "Inbox")
+        set movedCount to 0
+
+        repeat with aTodo in (to dos)
+            set todoTags to tag names of aTodo
+            if "{tag_name}" is in todoTags then
+                if (id of aTodo) is not in inboxIds then
+                    move aTodo to targetArea
+                    set movedCount to movedCount + 1
+                end if
+            end if
+        end repeat
+
+        return movedCount as string
+    end tell
+    """
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Migration failed: {result.stderr.strip()}")
+    else:
+        count = result.stdout.strip()
+        print(
+            f"Migration complete! Moved {count} {tag_name} tagged task(s) to the {area_name} area."
+        )
 
 
 def format_description(description_html: str):
@@ -140,4 +173,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Canvas to Things 3 task sync")
+    parser.add_argument(
+        "--migrate",
+        action="store_true",
+        help="Migrate tagged tasks out of Inbox to the configured area",
+    )
+    args = parser.parse_args()
+
+    if args.migrate:
+        migrate_tasks()
+    else:
+        main()
