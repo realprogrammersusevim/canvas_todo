@@ -191,9 +191,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Migrate tagged tasks out of Inbox to the configured area",
     )
+    parser.add_argument("--all", action="store_true", help="Sync and migrate tasks")
     args = parser.parse_args()
 
     if args.migrate:
+        migrate_tasks()
+    elif args.all:
+        main()
         migrate_tasks()
     else:
         main()
