@@ -88,7 +88,18 @@ def migrate_tasks() -> None:
             if "{tag_name}" is in todoTags then
                 if (id of aTodo) is not in inboxIds then
                     move aTodo to targetArea
-                    remove tag "{tag_name}" from aTodo
+                    set currentTags to tags of aTodo
+                    set newTags to {{}}
+                    repeat with aTag in currentTags
+                        set tagValue to name of aTag
+                        if tagValue is not "{tag_name}" then
+                            set end of newTags to tagValue
+                        end if
+                    end repeat
+                    set AppleScript's text item delimiters to ", "
+                    set newTagString to newTags as string
+                    set AppleScript's text item delimiters to ""
+                    set tag names of aTodo to newTagString
                     set movedCount to movedCount + 1
                 end if
             end if
