@@ -8,4 +8,5 @@ dependencies = [
     "markdownify",
     "canvasapi",
     "python-dotenv",
+    "requests",
 ]

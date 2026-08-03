@@ -33,9 +33,34 @@ Pulls upcoming assignments from Canvas LMS and adds them to
 
    Get your Canvas API token from **Account → Settings → New Access Token**.
 
-3. Run:
+3. Hand token management over to the script (optional but recommended):
+
+   ```sh
+   uv run main.py --bootstrap-token
+   ```
+
+   This creates a token the script owns and writes `API_KEY` and `TOKEN_ID` back
+   to `.env`. See [Token renewal](#token-renewal) below.
+
+4. Run:
    ```sh
    uv run main.py
    ```
 
 Things 3 must be open on your Mac for the tasks to be added.
+
+## Token renewal
+
+Canvas refuses to issue an access token more than 90 days out, so a hand-made
+token silently breaks the sync every quarter. An unexpired token can, however,
+push its own expiration date forward — so a token that gets used regularly never
+has to expire.
+
+After `--bootstrap-token`, every sync checks the token and slides its expiration
+back out to 89 days whenever fewer than 30 days remain. The token string itself
+never changes, so nothing else needs updating.
+
+The one catch: this only works while the token is still valid. If you don't sync
+for 30+ consecutive days after the last renewal, the token lapses and you'll
+need a new one from Canvas settings plus another `--bootstrap-token`. Running
+the sync on a schedule (or just using it) avoids this entirely.

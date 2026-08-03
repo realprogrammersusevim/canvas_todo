@@ -5,8 +5,9 @@ import argparse
 import subprocess
 import webbrowser
 import urllib.parse
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
+import requests
 from canvasapi import Canvas
 from dotenv import load_dotenv
 from markdownify import markdownify as html_to_markdown
@@ -16,6 +17,13 @@ load_dotenv()
 canvas = Canvas(os.getenv("API_URL"), os.getenv("API_KEY"))
 
 IMPORT_CACHE = Path(".imported_assignments.json")
+ENV_FILE = Path(".env")
+
+# Canvas caps token expiration at 90 days, but an unexpired token can slide its
+# own expiration forward. Renewing well before the deadline keeps the token
+# alive indefinitely without ever regenerating it.
+TOKEN_LIFETIME_DAYS = 89
+TOKEN_RENEW_WHEN_DAYS_LEFT = 30
 
 
 def load_imported_ids() -> set[str]:
@@ -40,6 +48,97 @@ def parse_canvas_datetime(date: str) -> datetime | None:
         return datetime.fromisoformat(iso_str).astimezone()
     except ValueError:
         return None
+
+
+def canvas_request(method: str, path: str, **kwargs) -> requests.Response:
+    """Call a Canvas REST endpoint that canvasapi doesn't wrap."""
+    base_url = (os.getenv("API_URL") or "").rstrip("/")
+    headers = {"Authorization": f"Bearer {os.getenv('API_KEY')}"}
+
+    return requests.request(
+        method, f"{base_url}/api/v1{path}", headers=headers, timeout=30, **kwargs
+    )
+
+
+def expiration_timestamp(days: int) -> str:
+    expires = datetime.now(UTC) + timedelta(days=days)
+
+    return expires.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def write_env_values(values: dict[str, str]) -> None:
+    """Update keys in .env in place, leaving comments and other keys alone."""
+    lines = ENV_FILE.read_text().splitlines() if ENV_FILE.exists() else []
+    pending = dict(values)
+
+    for index, line in enumerate(lines):
+        key = line.split("=", 1)[0].strip()
+        if key in pending:
+            lines[index] = f'{key}="{pending.pop(key)}"'
+
+    for key, value in pending.items():
+        lines.append(f'{key}="{value}"')
+
+    ENV_FILE.write_text("\n".join(lines) + "\n")
+
+
+def bootstrap_token() -> None:
+    """Create a token this script owns, so it can renew it on every sync."""
+    user = canvas_request("GET", "/users/self")
+    if not user.ok:
+        print(f"Current API_KEY isn't working ({user.status_code}). Nothing created.")
+        return
+
+    created = canvas_request(
+        "POST",
+        f"/users/{user.json()['id']}/tokens",
+        data={
+            "token[purpose]": "canvas_todo",
+            "token[expires_at]": expiration_timestamp(TOKEN_LIFETIME_DAYS),
+        },
+    )
+    if not created.ok:
+        print(f"Could not create a token ({created.status_code}): {created.text}")
+        return
+
+    token = created.json()
+    # The full token string is only ever returned at creation time.
+    write_env_values({"API_KEY": token["visible_token"], "TOKEN_ID": str(token["id"])})
+
+    print(f"Created token {token['id']}, expiring {token['expires_at']}.")
+    print("Saved to .env. Syncs will now renew it automatically.")
+
+
+def renew_token_if_needed() -> None:
+    token_id = os.getenv("TOKEN_ID")
+    if not token_id:
+        return
+
+    current = canvas_request("GET", f"/users/self/tokens/{token_id}")
+    if not current.ok:
+        print(f"Warning: couldn't read token {token_id} ({current.status_code}).")
+        return
+
+    expires_at = parse_canvas_datetime(current.json().get("expires_at"))
+    if not expires_at:
+        return
+
+    days_left = (expires_at - datetime.now().astimezone()).days
+    if days_left > TOKEN_RENEW_WHEN_DAYS_LEFT:
+        return
+
+    renewed = canvas_request(
+        "PUT",
+        f"/users/self/tokens/{token_id}",
+        data={"token[expires_at]": expiration_timestamp(TOKEN_LIFETIME_DAYS)},
+    )
+    if renewed.ok:
+        print(f"Renewed access token, now expiring {renewed.json()['expires_at']}.")
+    else:
+        print(
+            f"Warning: token renewal failed ({renewed.status_code}) "
+            f"with {days_left} day(s) left. Run --bootstrap-token before it lapses."
+        )
 
 
 def add_to_things(title: str, notes: str, date_str: str, tags: list[str] = []) -> None:
@@ -126,6 +225,8 @@ def format_description(description_html: str):
 
 
 def main():
+    renew_token_if_needed()
+
     imported_ids = load_imported_ids()
 
     # Get current user
@@ -192,9 +293,16 @@ if __name__ == "__main__":
         help="Migrate tagged tasks out of Inbox to the configured area",
     )
     parser.add_argument("--all", action="store_true", help="Sync and migrate tasks")
+    parser.add_argument(
+        "--bootstrap-token",
+        action="store_true",
+        help="Create a self-renewing access token and save it to .env",
+    )
     args = parser.parse_args()
 
-    if args.migrate:
+    if args.bootstrap_token:
+        bootstrap_token()
+    elif args.migrate:
         migrate_tasks()
     elif args.all:
         main()
