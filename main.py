@@ -1,292 +1,65 @@
-import json
-import os
-from pathlib import Path
+"""Composition root: reads configuration, picks an input source, wires it to Things."""
+
 import argparse
-import subprocess
-import webbrowser
-import urllib.parse
-from datetime import UTC, datetime, timedelta
+import os
+import sys
+from pathlib import Path
 
-import requests
-from canvasapi import Canvas
 from dotenv import load_dotenv
-from markdownify import markdownify as html_to_markdown
 
-# Initialize Canvas
-load_dotenv()
-canvas = Canvas(os.getenv("API_URL"), os.getenv("API_KEY"))
+from canvas_todo.cache import ImportCache
+from canvas_todo.sources import AssignmentSource, CanvasApiSource, IcsFeedSource
+from canvas_todo.sync import sync
+from canvas_todo.things import DryRunInbox, ThingsInbox
 
 IMPORT_CACHE = Path(".imported_assignments.json")
 ENV_FILE = Path(".env")
 
-# Canvas caps token expiration at 90 days, but an unexpired token can slide its
-# own expiration forward. Renewing well before the deadline keeps the token
-# alive indefinitely without ever regenerating it.
-TOKEN_LIFETIME_DAYS = 89
-TOKEN_RENEW_WHEN_DAYS_LEFT = 30
 
+def build_source(choice: str) -> AssignmentSource:
+    """Construct the requested input source, or explain what configuration is missing."""
+    feed_url = os.getenv("ICS_URL")
+    api_url, api_key = os.getenv("API_URL"), os.getenv("API_KEY")
 
-def load_imported_ids() -> set[str]:
-    if not IMPORT_CACHE.exists():
-        return set()
+    if choice == "auto":
+        choice = "ics" if feed_url else "api"
 
-    return set(json.loads(IMPORT_CACHE.read_text()))
+    if choice == "ics":
+        if not feed_url:
+            sys.exit(
+                "No ICS_URL in .env. Get the feed URL from Canvas under "
+                "Calendar -> Calendar Feed."
+            )
 
+        codes = {
+            code.strip()
+            for code in (os.getenv("COURSE_CODES") or "").split(",")
+            if code.strip()
+        }
 
-def save_imported_ids(ids_set: set[str]) -> None:
-    IMPORT_CACHE.write_text(json.dumps(sorted(ids_set), indent=2))
+        return IcsFeedSource(feed_url, course_codes=codes)
 
-
-def parse_canvas_datetime(date: str) -> datetime | None:
-    if not date:
-        return None
-
-    try:
-        # Canvas returns UTC timestamps with a trailing "Z".
-        # Convert to local time so the date isn't off by one.
-        iso_str = date.replace("Z", "+00:00")
-        return datetime.fromisoformat(iso_str).astimezone()
-    except ValueError:
-        return None
-
-
-def canvas_request(method: str, path: str, **kwargs) -> requests.Response:
-    """Call a Canvas REST endpoint that canvasapi doesn't wrap."""
-    base_url = (os.getenv("API_URL") or "").rstrip("/")
-    headers = {"Authorization": f"Bearer {os.getenv('API_KEY')}"}
-
-    return requests.request(
-        method, f"{base_url}/api/v1{path}", headers=headers, timeout=30, **kwargs
-    )
-
-
-def expiration_timestamp(days: int) -> str:
-    expires = datetime.now(UTC) + timedelta(days=days)
-
-    return expires.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def write_env_values(values: dict[str, str]) -> None:
-    """Update keys in .env in place, leaving comments and other keys alone."""
-    lines = ENV_FILE.read_text().splitlines() if ENV_FILE.exists() else []
-    pending = dict(values)
-
-    for index, line in enumerate(lines):
-        key = line.split("=", 1)[0].strip()
-        if key in pending:
-            lines[index] = f'{key}="{pending.pop(key)}"'
-
-    for key, value in pending.items():
-        lines.append(f'{key}="{value}"')
-
-    ENV_FILE.write_text("\n".join(lines) + "\n")
-
-
-def bootstrap_token() -> None:
-    """Create a token this script owns, so it can renew it on every sync."""
-    user = canvas_request("GET", "/users/self")
-    if not user.ok:
-        print(f"Current API_KEY isn't working ({user.status_code}). Nothing created.")
-        return
-
-    created = canvas_request(
-        "POST",
-        f"/users/{user.json()['id']}/tokens",
-        data={
-            "token[purpose]": "canvas_todo",
-            "token[expires_at]": expiration_timestamp(TOKEN_LIFETIME_DAYS),
-        },
-    )
-    if not created.ok:
-        print(f"Could not create a token ({created.status_code}): {created.text}")
-        return
-
-    token = created.json()
-    # The full token string is only ever returned at creation time.
-    write_env_values({"API_KEY": token["visible_token"], "TOKEN_ID": str(token["id"])})
-
-    print(f"Created token {token['id']}, expiring {token['expires_at']}.")
-    print("Saved to .env. Syncs will now renew it automatically.")
-
-
-def renew_token_if_needed() -> None:
-    token_id = os.getenv("TOKEN_ID")
-    if not token_id:
-        return
-
-    current = canvas_request("GET", f"/users/self/tokens/{token_id}")
-    if not current.ok:
-        print(f"Warning: couldn't read token {token_id} ({current.status_code}).")
-        return
-
-    expires_at = parse_canvas_datetime(current.json().get("expires_at"))
-    if not expires_at:
-        return
-
-    days_left = (expires_at - datetime.now().astimezone()).days
-    if days_left > TOKEN_RENEW_WHEN_DAYS_LEFT:
-        return
-
-    renewed = canvas_request(
-        "PUT",
-        f"/users/self/tokens/{token_id}",
-        data={"token[expires_at]": expiration_timestamp(TOKEN_LIFETIME_DAYS)},
-    )
-    if renewed.ok:
-        print(f"Renewed access token, now expiring {renewed.json()['expires_at']}.")
-    else:
-        print(
-            f"Warning: token renewal failed ({renewed.status_code}) "
-            f"with {days_left} day(s) left. Run --bootstrap-token before it lapses."
+    if not (api_url and api_key):
+        sys.exit(
+            "No API_URL/API_KEY in .env. Canvas access tokens come from "
+            "Account -> Settings -> New Access Token."
         )
 
-
-def add_to_things(title: str, notes: str, date_str: str, tags: list[str] = []) -> None:
-    """
-    Constructs a Things 3 URL to add a task to the Inbox and executes it.
-    New tasks are always tagged so they can be identified and migrated later.
-    """
-    base_url = "things:///add?"
-
-    all_tags = list(tags) + [os.getenv("TAG_NAME", "New")]
-    params = {
-        "title": title,
-        "notes": notes,
-        "tags": ",".join(all_tags),
-        "show-quick-entry": "false",
-    }
-
-    # Handle Date Parsing (Canvas returns ISO 8601: 2023-10-27T23:59:59Z)
-    dt_obj = parse_canvas_datetime(date_str)
-    if dt_obj:
-        # Things 3 accepts YYYY-MM-DD for deadlines
-        params["deadline"] = dt_obj.strftime("%Y-%m-%d")
-
-    # Encode the URL with %20 for spaces (Things expects percent-encoding).
-    final_url = base_url + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
-
-    # Open the URL (Fires the command to Things 3)
-    webbrowser.open(final_url)
-
-
-def migrate_tasks() -> None:
-    """
-    Uses AppleScript to find all tagged todos that are no longer in the
-    Inbox (i.e. have been reviewed and scheduled) and moves them to a list.
-    """
-    area_name = os.getenv("AREA_NAME", "New")
-    tag_name = os.getenv("TAG_NAME", "New")
-    script = f"""
-    tell application "Things3"
-        set targetArea to area "{area_name}"
-        set inboxIds to id of (to dos of list "Inbox")
-        set movedCount to 0
-
-        repeat with aTodo in (to dos)
-            set todoTags to tag names of aTodo
-            if "{tag_name}" is in todoTags then
-                if (id of aTodo) is not in inboxIds then
-                    move aTodo to targetArea
-                    set currentTags to tags of aTodo
-                    set newTags to {{}}
-                    repeat with aTag in currentTags
-                        set tagValue to name of aTag
-                        if tagValue is not "{tag_name}" then
-                            set end of newTags to tagValue
-                        end if
-                    end repeat
-                    set AppleScript's text item delimiters to ", "
-                    set newTagString to newTags as string
-                    set AppleScript's text item delimiters to ""
-                    set tag names of aTodo to newTagString
-                    set movedCount to movedCount + 1
-                end if
-            end if
-        end repeat
-
-        return movedCount as string
-    end tell
-    """
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Migration failed: {result.stderr.strip()}")
-    else:
-        count = result.stdout.strip()
-        print(
-            f"Migration complete! Moved {count} {tag_name} tagged task(s) to the {area_name} area."
-        )
-
-
-def format_description(description_html: str):
-    if not description_html:
-        return ""
-
-    return html_to_markdown(description_html).strip()
-
-
-def main():
-    renew_token_if_needed()
-
-    imported_ids = load_imported_ids()
-
-    # Get current user
-    user = canvas.get_current_user()
-
-    # if there aren't favorited courses this defaults to enrolled courses
-    courses = user.get_favorite_courses()
-
-    print("Fetching assignments...")
-
-    assignment_entries = []
-
-    for course in courses:
-        # Check if course has a name (some are restricting access)
-        if not hasattr(course, "name"):
-            continue
-
-        print(f"Checking course: {course.name}")
-
-        # Get upcoming assignments
-        # "bucket='upcoming'" fetches only future assignments
-        assignments = course.get_assignments(bucket="upcoming")
-
-        for assignment in assignments:
-            if str(assignment.id) in imported_ids:
-                continue
-
-            due_dt = parse_canvas_datetime(assignment.due_at)
-            assignment_entries.append((due_dt, course.name, assignment))
-
-    assignment_entries.sort(
-        key=lambda entry: (
-            entry[0] or datetime.max,
-            entry[1].lower(),
-        ),
-        reverse=True,
+    return CanvasApiSource(
+        api_url, api_key, token_id=os.getenv("TOKEN_ID"), env_file=ENV_FILE
     )
 
-    print(f"Adding {len(assignment_entries)} Todos to Things")
 
-    for due_dt, course_name, assignment in assignment_entries:
-        # Construct the task title (Course Name: Assignment Name)
-        task_title = f"{course_name}: {assignment.name}"
-
-        # Create notes with a link back to Canvas
-        # 'html_url' is the link to the assignment page
-        description_md = format_description(assignment.description)
-        task_notes = f"Link: {assignment.html_url}"
-        if description_md:
-            task_notes = f"{task_notes}\n\n{description_md}"
-
-        add_to_things(task_title, task_notes, assignment.due_at)
-        imported_ids.add(str(assignment.id))
-
-    print("Done! Check your Things 3 Inbox.")
-    save_imported_ids(imported_ids)
-
-
-if __name__ == "__main__":
+def main() -> None:
     parser = argparse.ArgumentParser(description="Canvas to Things 3 task sync")
+    parser.add_argument(
+        "--source",
+        choices=["auto", "api", "ics"],
+        default="auto",
+        help="Where assignments come from: the REST API (needs a personal access "
+        "token) or the calendar feed (needs none). Default picks the feed when "
+        "ICS_URL is set.",
+    )
     parser.add_argument(
         "--migrate",
         action="store_true",
@@ -294,18 +67,43 @@ if __name__ == "__main__":
     )
     parser.add_argument("--all", action="store_true", help="Sync and migrate tasks")
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be added without touching Things or the import cache",
+    )
+    parser.add_argument(
         "--bootstrap-token",
         action="store_true",
-        help="Create a self-renewing access token and save it to .env",
+        help="Create a self-renewing access token and save it to .env (API source only)",
     )
     args = parser.parse_args()
 
+    load_dotenv()
+
+    inbox = ThingsInbox(
+        tag_name=os.getenv("TAG_NAME", "New"), area_name=os.getenv("AREA_NAME", "New")
+    )
+
     if args.bootstrap_token:
-        bootstrap_token()
-    elif args.migrate:
-        migrate_tasks()
-    elif args.all:
-        main()
-        migrate_tasks()
-    else:
-        main()
+        source = build_source("api")
+        source.bootstrap_token()
+        return
+
+    if args.migrate:
+        inbox.migrate_tasks()
+        return
+
+    cache = ImportCache(IMPORT_CACHE, persist=not args.dry_run)
+    sync(build_source(args.source), DryRunInbox() if args.dry_run else inbox, cache)
+
+    if args.dry_run:
+        return
+
+    print("Done! Check your Things 3 Inbox.")
+
+    if args.all:
+        inbox.migrate_tasks()
+
+
+if __name__ == "__main__":
+    main()
